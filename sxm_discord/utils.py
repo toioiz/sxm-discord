@@ -1,197 +1,248 @@
-import os
+"""
+Utility functions for SXM Discord bot.
+"""
+
+from __future__ import annotations
+
+import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-from discord import Embed, Message
-from discord.ext.commands import errors
-from discord_slash import SlashContext  # type: ignore
-from humanize import naturaltime  # type: ignore
-from sxm.models import XMArt, XMChannel, XMCutMarker, XMEpisodeMarker, XMImage, XMSong
-from sxm_player.models import Episode, PlayerState, Song
+import discord
+from discord import Embed
+from humanize import naturaltime
+from sxm.models import XMArt, XMChannel, XMCutMarker, XMImage, XMSong
 
-__all__ = ["send_message"]
-
-ROOT_COMMAND_ENV = "SXM_INTERNAL_ROOT_COMMAND"
-SXM_COG_NAME = "SXMMusic"
+if TYPE_CHECKING:
+    from sxm.models import XMLiveChannel
+    from sxm_player.models import Episode, PlayerState, Song
 
 
-def get_cog(ctx: SlashContext):
-    return ctx.bot.cogs[SXM_COG_NAME]
+logger = logging.getLogger(__name__)
+
+# Module-level root command (set during startup)
+_ROOT_COMMAND = "music"
 
 
-def set_root_command(value: str):
-    os.environ[ROOT_COMMAND_ENV] = value
+def set_root_command(command: str) -> None:
+    """Set the root slash command name."""
+    global _ROOT_COMMAND
+    _ROOT_COMMAND = command
 
 
 def get_root_command() -> str:
-    return os.environ.get(ROOT_COMMAND_ENV, "Music")
+    """Get the root slash command name."""
+    return _ROOT_COMMAND
 
 
-async def send_message(
-    ctx: SlashContext,
-    message: Optional[str] = None,
-    embed: Optional[Embed] = None,
-) -> Message:
-    if message is None and embed is None:
-        raise errors.CommandError("A message or a embed must be provided")
+def get_art_url_by_size(
+    arts: Optional[List[Union[XMArt, XMImage]]],
+    size: str
+) -> Optional[str]:
+    """Get artwork URL by size preference."""
+    if arts is None:
+        return None
 
-    return await ctx.send(message, embed=embed)
+    for art in arts:
+        if hasattr(art, 'size') and art.size == size:
+            return art.url
+        elif hasattr(art, 'name') and art.name == size:
+            return art.url
+
+    # Fallback to first available
+    if arts:
+        return arts[0].url
+
+    return None
+
+
+def create_base_embed(
+    title: str,
+    description: Optional[str] = None,
+    color: int = 0x3498db,
+    thumbnail_url: Optional[str] = None,
+    footer: Optional[str] = None,
+) -> Embed:
+    """Create a base embed with common styling."""
+    embed = Embed(
+        title=title,
+        description=description,
+        color=color,
+    )
+
+    if thumbnail_url:
+        embed.set_thumbnail(url=thumbnail_url)
+
+    if footer:
+        embed.set_footer(text=footer)
+
+    return embed
 
 
 def generate_embed_from_cut(
-    xm_channel: XMChannel,
-    cut: Optional[XMCutMarker],
-    episode: Optional[XMEpisodeMarker] = None,
+    channel: XMChannel,
+    cut: XMCutMarker,
+    episode: Optional[object] = None,
     footer: Optional[str] = None,
 ) -> Embed:
-    np_title = None
-    np_author = None
-    np_thumbnail = None
-    np_album = None
-    np_episode_title = None
+    """Generate an embed for an SXM song cut."""
+    song = cut.cut
 
-    if cut is not None and isinstance(cut.cut, XMSong):
-        song = cut.cut
-        np_title = song.title
-        np_author = song.artists[0].name
+    if not isinstance(song, XMSong):
+        # Handle non-song cuts (shows, etc.)
+        title = getattr(song, 'title', 'Unknown')
+        embed = create_base_embed(
+            title=title,
+            description=f"On {channel.pretty_name}",
+            footer=footer,
+        )
+        return embed
 
-        if song.album is not None:
-            album = song.album
-            if album.title is not None:
-                np_album = album.title
+    # Get artwork
+    image_url = None
+    if song.album and song.album.arts:
+        image_url = get_art_url_by_size(song.album.arts, "MEDIUM")
 
-            np_thumbnail = get_art_url_by_size(album.arts, "MEDIUM")
+    # Build description
+    artist = song.artists[0].name if song.artists else "Unknown Artist"
+    description_parts = [f"**{artist}**"]
 
-    if episode is not None:
-        np_episode_title = episode.episode.long_title
+    if song.album:
+        description_parts.append(f"Album: {song.album.title}")
 
-        if np_thumbnail is None:
-            np_thumbnail = get_art_thumb_url(episode.episode.show.arts)
+    if episode:
+        episode_title = getattr(episode.episode, 'long_title', None)
+        if episode_title:
+            description_parts.append(f"Show: {episode_title}")
 
-    embed = Embed(title=np_title)
-    if np_author is not None:
-        embed.set_author(name=np_author)
-    if np_thumbnail is not None:
-        embed.set_thumbnail(url=np_thumbnail)
-    if np_album is not None:
-        embed.add_field(name="Album", value=np_album)
-    embed.add_field(name="SXM", value=xm_channel.pretty_name, inline=True)
-    if np_episode_title is not None:
-        embed.add_field(name="Show", value=np_episode_title, inline=True)
+    embed = create_base_embed(
+        title=song.title,
+        description="\n".join(description_parts),
+        thumbnail_url=image_url,
+        footer=footer,
+    )
 
-    if footer is not None:
-        embed.set_footer(text=footer)
+    # Add channel info
+    embed.add_field(
+        name="Channel",
+        value=f"{channel.pretty_name} (#{channel.channel_number})",
+        inline=True
+    )
 
     return embed
 
 
 def generate_embed_from_archived(
-    item: Union[Song, Episode], footer: Optional[str] = None
-) -> Optional[Embed]:
+    item: Union[Song, Episode],
+    footer: Optional[str] = None,
+) -> Embed:
+    """Generate an embed for an archived song or episode."""
+    from sxm_player.models import Episode, Song
+
     if isinstance(item, Song):
-        return generate_embed_from_song(item, footer=footer)
-    return None
+        title = item.title
+        description = f"**{item.artist}**"
+        if item.album:
+            description += f"\nAlbum: {item.album}"
+        image_url = item.image_url
+    else:
+        # Episode
+        title = item.title
+        description = f"Show: {item.show}"
+        image_url = item.image_url if hasattr(item, 'image_url') else None
 
-
-def generate_embed_from_song(song: Song, footer: Optional[str] = None) -> Embed:
-
-    embed = Embed(title=song.title)
-    embed.set_author(name=song.artist)
-
-    if song.image_url is not None:
-        embed.set_thumbnail(url=song.image_url)
-    if song.album is not None:
-        embed.add_field(name="Album", value=song.album)
-
-    embed.add_field(
-        name="Aired",
-        value=naturaltime(song.air_time_smart, when=datetime.now(timezone.utc)),
-        inline=True,
+    embed = create_base_embed(
+        title=title,
+        description=description,
+        thumbnail_url=image_url,
+        footer=footer,
     )
-    embed.add_field(name="SXM", value=song.channel, inline=True)
 
-    if footer is not None:
-        embed.set_footer(text=footer)
+    # Add metadata
+    if hasattr(item, 'channel') and item.channel:
+        embed.add_field(name="Channel", value=item.channel, inline=True)
+
+    if hasattr(item, 'air_time') and item.air_time:
+        time_str = naturaltime(datetime.now(timezone.utc) - item.air_time)
+        embed.add_field(name="Aired", value=time_str, inline=True)
 
     return embed
 
 
-def _get_xm_channel(state: PlayerState) -> XMChannel:
-    if state.stream_channel is None:
-        raise ValueError("`stream_channel` cannot be empty")
-
+def generate_now_playing_embed(
+    state: PlayerState,
+) -> Tuple[XMChannel, Embed]:
+    """Generate an embed for the currently playing live channel."""
     xm_channel = state.get_channel(state.stream_channel)
 
     if xm_channel is None:
-        raise ValueError("`xm_channel` could not be found")
+        raise ValueError("No channel information available")
 
-    return xm_channel
+    live = state.live
+    radio_time = state.radio_time
 
+    # Try to get current song
+    embed_title = xm_channel.pretty_name
+    description_parts = [f"Channel #{xm_channel.channel_number}"]
+    image_url = None
+    footer = None
 
-def generate_now_playing_embed(state: PlayerState) -> Tuple[XMChannel, Embed]:
-    xm_channel = _get_xm_channel(state)
-    if state.live is not None:
-        cut = state.live.get_latest_cut(now=state.radio_time)
-        episode = state.live.get_latest_episode(now=state.radio_time)
+    if live is not None:
+        latest_cut = live.get_latest_cut(now=radio_time)
 
-    return xm_channel, generate_embed_from_cut(xm_channel, cut, episode)
+        if latest_cut and isinstance(latest_cut.cut, XMSong):
+            song = latest_cut.cut
+            embed_title = song.title
+            artist = song.artists[0].name if song.artists else "Unknown"
+            description_parts = [f"**{artist}**", f"on {xm_channel.pretty_name}"]
+
+            if song.album:
+                description_parts.append(f"Album: {song.album.title}")
+                if song.album.arts:
+                    image_url = get_art_url_by_size(song.album.arts, "MEDIUM")
+
+            footer = "Now Playing"
+        else:
+            # Check for episode/show
+            episode = live.get_latest_episode(now=radio_time)
+            if episode:
+                episode_title = getattr(episode.episode, 'long_title', 'Unknown Show')
+                description_parts.append(f"Show: {episode_title}")
+
+    embed = create_base_embed(
+        title=embed_title,
+        description="\n".join(description_parts),
+        thumbnail_url=image_url,
+        footer=footer,
+    )
+
+    return xm_channel, embed
 
 
 def get_recent_songs(
-    state: PlayerState, count: int
+    state: PlayerState,
+    count: int = 3,
 ) -> Tuple[XMChannel, List[XMCutMarker], Optional[XMCutMarker]]:
-    xm_channel = _get_xm_channel(state)
+    """Get recent songs from the live channel."""
+    xm_channel = state.get_channel(state.stream_channel)
 
-    if state.live is None or xm_channel is None:
-        return (xm_channel, [], None)
+    if xm_channel is None:
+        raise ValueError("No channel information available")
 
     song_cuts: List[XMCutMarker] = []
-    now = state.radio_time or datetime.now(timezone.utc)
-    latest_cut = state.live.get_latest_cut(now)
+    latest_cut: Optional[XMCutMarker] = None
 
-    for song_cut in reversed(state.live.song_cuts):
-        if len(song_cuts) >= count:
-            break
+    if state.live is not None:
+        radio_time = state.radio_time
 
-        if song_cut == latest_cut:
-            song_cuts.append(song_cut)
-            continue
+        # Get all recent cuts
+        for cut in state.live.song_cuts[:count + 5]:  # Get extra in case of filtering
+            if isinstance(cut.cut, XMSong):
+                if latest_cut is None:
+                    latest_cut = cut
+                song_cuts.append(cut)
 
-        end = song_cut.time + song_cut.duration
-        if (
-            state.start_time is not None
-            and song_cut.time < now
-            and (end > state.start_time or song_cut.time > state.start_time)
-        ):
-            song_cuts.append(song_cut)
+                if len(song_cuts) >= count:
+                    break
 
     return xm_channel, song_cuts, latest_cut
-
-
-def get_art_url_by_size(arts: List[XMArt], size: str) -> Optional[str]:
-    for art in arts:
-        if isinstance(art, XMImage) and art.size is not None and art.size == size:
-            return art.url
-    return None
-
-
-def get_art_thumb_url(arts: List[XMArt]) -> Optional[str]:
-    thumb: Optional[str] = None
-
-    for art in arts:
-        if (
-            isinstance(art, XMImage)
-            and art.height is not None
-            and art.height > 100
-            and art.height < 200
-            and art.height == art.width
-        ):
-            # logo on dark is what we really want
-            if art.name == "show logo on dark":
-                thumb = art.url
-                break
-            # but it is not always there, so fallback image
-            elif art.name == "image":
-                thumb = art.url
-
-    return thumb

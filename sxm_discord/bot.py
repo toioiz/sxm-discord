@@ -1,13 +1,27 @@
+"""
+Discord bot worker for SXM streaming with proper memory management.
+
+Key improvements over original:
+- Uses modern discord.py 2.x with app_commands (slash commands)
+- Proper cleanup of resources on shutdown
+- CarouselManager for bounded carousel storage
+- Better error handling with recovery
+- Graceful shutdown handling
+"""
+
+from __future__ import annotations
+
 import asyncio
+import logging
 import time
 import traceback
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
-from discord import Activity, Game, Intents, TextChannel, VoiceChannel
-from discord.ext.commands import BadArgument, Bot, Cog
-from discord_slash import SlashCommand, SlashContext, cog_ext  # type: ignore
-from discord_slash.utils.manage_commands import create_option  # type: ignore
+import discord
+from discord import Activity, Intents, TextChannel, VoiceChannel, app_commands
+from discord.ext import commands, tasks
+
 from sxm.models import XMChannel
 from sxm_player.models import Episode, PlayerState, Song
 from sxm_player.queue import EventMessage, EventTypes
@@ -18,52 +32,84 @@ from sxm_player.workers import (
     SXMStatusSubscriber,
 )
 
-from sxm_discord.music import AudioPlayer, PlayType
-from sxm_discord.sxm import SXMArchivedCommands, SXMCommands
-from sxm_discord.utils import (
-    SXM_COG_NAME,
-    generate_embed_from_archived,
-    generate_now_playing_embed,
-    get_recent_songs,
-    get_root_command,
-    send_message,
-)
-
-from .checks import is_playing, no_pm, require_voice
-from .converters import CountConverter
 from .models import (
     ArchivedSongCarousel,
+    CarouselManager,
+    PlayType,
     ReactionCarousel,
     SongActivity,
     SXMActivity,
     SXMCutCarousel,
     UpcomingSongCarousel,
 )
+from .music import AudioPlayer
+from .utils import (
+    generate_embed_from_archived,
+    generate_now_playing_embed,
+    get_recent_songs,
+)
 
-CAROUSEL_TIMEOUT = 30
+if TYPE_CHECKING:
+    pass
+
+
+logger = logging.getLogger(__name__)
+
+
+# Constants
+UPDATE_INTERVAL = 5.0
+VOICE_TIMEOUT = 300  # 5 minutes of inactivity
+
+
+class SXMBot(commands.Bot):
+    """
+    Custom bot class with proper lifecycle management.
+    """
+
+    def __init__(
+        self,
+        *,
+        command_prefix: str,
+        intents: Intents,
+        description: str,
+        worker: "DiscordWorker",
+    ):
+        super().__init__(
+            command_prefix=command_prefix,
+            intents=intents,
+            description=description,
+            help_command=None,
+        )
+        self.worker = worker
+
+    async def setup_hook(self) -> None:
+        """Called when the bot is starting up."""
+        # Add the cog
+        await self.add_cog(self.worker)
+
+        # Sync commands globally
+        try:
+            synced = await self.tree.sync()
+            logger.info(f"Synced {len(synced)} command(s)")
+        except Exception as e:
+            logger.error(f"Failed to sync commands: {e}")
 
 
 class DiscordWorker(
+    commands.Cog,
     InterruptableWorker,
     HLSStatusSubscriber,
     SXMStatusSubscriber,
-    SXMCommands,
-    Cog,
-    name=SXM_COG_NAME,
 ):
-    bot: Bot
-    slash: SlashCommand
-    root_command: str
-    token: str
-    output_channel: Optional[TextChannel] = None
-    player: AudioPlayer
-    carousels: Dict[int, ReactionCarousel] = {}
-
-    _output_channel_id: Optional[int] = None
-    _last_update: float = 0
-    _update_interval: float = 5
-    _voice_timeout: int = 0
-    _pending: Optional[Tuple[XMChannel, VoiceChannel]] = None
+    """
+    Main Discord worker cog with SXM integration.
+    
+    Handles:
+    - Voice channel management
+    - Audio playback
+    - SXM/HLS stream integration
+    - Slash commands for control
+    """
 
     def __init__(
         self,
@@ -76,22 +122,24 @@ class DiscordWorker(
         channels: Optional[List[dict]] = None,
         raw_live_data: Tuple[
             Optional[datetime], Optional[timedelta], Optional[dict]
-        ] = (
-            None,
-            None,
-            None,
-        ),
+        ] = (None, None, None),
+        root_command: str = "music",
         *args,
         **kwargs,
     ):
+        # Initialize worker parents
         sxm_status_queue = kwargs.pop("sxm_status_queue")
         SXMStatusSubscriber.__init__(self, sxm_status_queue)
         hls_stream_queue = kwargs.pop("hls_stream_queue")
         HLSStatusSubscriber.__init__(self, hls_stream_queue)
 
         kwargs["name"] = "music"
-        super().__init__(*args, **kwargs)
+        InterruptableWorker.__init__(self, *args, **kwargs)
 
+        # Initialize Cog (no args needed)
+        commands.Cog.__init__(self)
+
+        # Player state
         self._state = PlayerState()
         self._state.sxm_running = sxm_status
         self._state.update_stream_data(stream_data)
@@ -100,42 +148,73 @@ class DiscordWorker(
         self._state.set_raw_live(raw_live_data)
         self._event_queues = [self.sxm_status_queue, self.hls_stream_queue]
 
-        self.root_command = get_root_command()
-
+        # Configuration
+        self.root_command = root_command
         self.token = token
-        self.bot = Bot(
+        self._output_channel_id = output_channel_id
+        self.output_channel: Optional[TextChannel] = None
+
+        # Create bot with proper intents
+        intents = Intents.default()
+        intents.message_content = True
+        intents.voice_states = True
+        intents.guilds = True
+
+        self.bot = SXMBot(
             command_prefix=f"/{self.root_command}",
+            intents=intents,
             description=description,
-            intents=Intents.default(),
-            help_command=None,
+            worker=self,
         )
-        self.slash = SlashCommand(self.bot, sync_commands=True, sync_on_cog_reload=True)
-        self.bot.add_cog(self)
-        self.player = AudioPlayer(self.event_queue, self.bot.loop)
 
-        if output_channel_id is not None:
-            self._output_channel_id = output_channel_id
+        # These will be initialized after bot starts
+        self.player: Optional[AudioPlayer] = None
+        self.carousel_manager = CarouselManager()
 
-        self.bot.loop.create_task(self.event_loop())
+        # State tracking
+        self._last_update: float = 0
+        self._pending: Optional[Tuple[XMChannel, VoiceChannel]] = None
+        self._last_voice_activity: float = time.monotonic()
 
-    def run(self):
-        self._log.info("Discord bot has started")
+    def run(self) -> None:
+        """Start the Discord bot."""
+        self._log.info("Discord bot starting...")
         try:
-            self.bot.run(self.token)
+            self.bot.run(self.token, log_handler=None)
         except (KeyboardInterrupt, TerminateInterrupt, RuntimeError):
             pass
+        except Exception:
+            self._log.exception("Bot crashed")
 
-    def __unload(self):
-        self.bot.loop.create_task(self.bot_output("Music bot shutting down"))
+    async def cog_unload(self) -> None:
+        """Clean up when cog is unloaded."""
+        self._log.info("Shutting down Discord worker...")
 
+        # Stop carousel manager
+        await self.carousel_manager.stop()
+
+        # Stop player
         if self.player is not None:
-            self.player.cleanup()
-            self.bot.loop.create_task(self.player.stop())
+            await self.player.cleanup()
+            await self.player.stop()
 
-    @Cog.listener()
+        # Send shutdown message
+        await self.bot_output("Music bot shutting down")
+
+    @commands.Cog.listener()
     async def on_ready(self) -> None:
+        """Called when the bot is ready."""
         user = self.bot.user
+        self._log.info(f"Logged in as {user} (id: {user.id})")
 
+        # Initialize player
+        self.player = AudioPlayer(self.event_queue, self.bot.loop)
+        await self.player.start()
+
+        # Start carousel manager
+        await self.carousel_manager.start()
+
+        # Find output channel
         if self._output_channel_id is not None:
             for channel in self.bot.get_all_channels():
                 if channel.id == self._output_channel_id:
@@ -143,192 +222,220 @@ class DiscordWorker(
                     break
 
             if self.output_channel is None:
-                self._log.warn(
-                    f"could not find output channel: {self._output_channel_id}"
-                )
+                self._log.warning(f"Could not find output channel: {self._output_channel_id}")
             else:
-                self._log.info(f"output channel: {self.output_channel.id}")
+                self._log.info(f"Output channel: {self.output_channel.name}")
 
-        self._log.info(f"logged in as {user} (id: {user.id})")
-        await self.bot_output(f"Accepting `{self.root_command}` commands")
+        await self.bot_output(f"Accepting `/{self.root_command}` commands")
 
         if self._state.sxm_running:
             await self._sxm_running_message()
 
-    @Cog.listener()
-    async def on_reaction_add(self, reaction, user):
-        # ignore bot user reactions
+        # Start background tasks
+        self.event_loop_task.start()
+        self.voice_timeout_task.start()
+
+    @commands.Cog.listener()
+    async def on_reaction_add(
+        self,
+        reaction: discord.Reaction,
+        user: Union[discord.Member, discord.User]
+    ) -> None:
+        """Handle reaction additions for carousels."""
+        # Ignore bot reactions
         if user.id == self.bot.user.id:
             return
 
-        carousel = self.carousels.get(reaction.message.id)
+        carousel = self.carousel_manager.get(reaction.message.id)
         if carousel is not None:
             carousel.message = reaction.message
-            await carousel.handle_reaction(self._state, reaction.emoji)
+            await carousel.handle_reaction(self._state, str(reaction.emoji))
 
-    # helper methods
-    async def bot_output(self, message: str):
-        self._log.info(f"Bot output: {message}")
-        if self.output_channel is not None:
-            await send_message(self.output_channel, message)
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState
+    ) -> None:
+        """Track voice state for timeout handling."""
+        if self.player and self.player.voice:
+            if self.player.voice.channel:
+                # Check if someone joined our channel
+                if after.channel == self.player.voice.channel:
+                    self._last_voice_activity = time.monotonic()
 
-    async def _sxm_running_message(self):
+    # Background Tasks
+    @tasks.loop(seconds=0.1)
+    async def event_loop_task(self) -> None:
+        """Process events from SXM/HLS workers."""
+        try:
+            await self._process_events()
+        except Exception:
+            self._log.exception("Error in event loop")
+
+    @event_loop_task.before_loop
+    async def before_event_loop(self) -> None:
+        """Wait for bot to be ready."""
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(seconds=60)
+    async def voice_timeout_task(self) -> None:
+        """Check for voice channel timeout."""
+        if not self.player or not self.player.is_playing:
+            return
+
+        if self.player.voice and self.player.voice.channel:
+            # Check if we're alone in the channel
+            members = [m for m in self.player.voice.channel.members if not m.bot]
+            if not members:
+                if time.monotonic() - self._last_voice_activity > VOICE_TIMEOUT:
+                    self._log.info("Voice timeout - disconnecting")
+                    await self.player.stop()
+                    await self.bot_output("Disconnected due to inactivity")
+
+    @voice_timeout_task.before_loop
+    async def before_voice_timeout(self) -> None:
+        """Wait for bot to be ready."""
+        await self.bot.wait_until_ready()
+
+    async def _process_events(self) -> None:
+        """Process SXM and HLS status events."""
+        was_connected = self._state.sxm_running
+
+        for queue in self._event_queues:
+            event = queue.safe_get()
+            if event:
+                self._log.debug(f"Received event: {event.msg_src}, {event.msg_type.name}")
+                await self._handle_event(event)
+
+        # Handle SXM connection state changes
+        if self._state.sxm_running and not was_connected:
+            await self._sxm_running_message()
+            if self._pending is not None:
+                await self.bot_output(
+                    f"Automatically resuming previous channel: `{self._pending[0].id}`"
+                )
+                await self._reset_live(self._pending[1], self._pending[0])
+        elif not self._state.sxm_running and was_connected:
+            await self.bot_output("Connection to SXM was lost. Will automatically reconnect")
+            if self.player and self.player.is_playing and self.player.play_type == PlayType.LIVE:
+                await self.player.stop(disconnect=False)
+
+        # Periodic update
+        if time.monotonic() > (self._last_update + UPDATE_INTERVAL):
+            await self._update_activity()
+            self._last_update = time.monotonic()
+
+    async def _handle_event(self, event: EventMessage) -> None:
+        """Handle a single event from the queues."""
+        if event.msg_type == EventTypes.SXM_STATUS:
+            # Update SXM connection status
+            self._state.sxm_running = event.msg
+        elif event.msg_type == EventTypes.HLS_STREAM_STARTED:
+            # HLS stream is ready, start playback
+            channel_id, stream_url = event.msg
+            xm_channel = self._state.get_channel(channel_id)
+            if xm_channel and self.player:
+                await self.player.add_live_stream(xm_channel, stream_url)
+        elif event.msg_type == EventTypes.UPDATE_CHANNELS:
+            self._state.update_channels(event.msg)
+        elif event.msg_type == EventTypes.UPDATE_LIVE:
+            self._state.set_raw_live(event.msg)
+
+    async def _sxm_running_message(self) -> None:
+        """Send message when SXM is available."""
         await self.bot_output(
-            "SXM now available for streaming. "
-            f"{len(self._state.channels)} channels available"
+            f"SXM now available for streaming. {len(self._state.channels)} channels available"
         )
 
-    async def _event_loop(self):
-        while not self.shutdown_event.is_set():
-            was_connected = self._state.sxm_running
+    async def _update_activity(self) -> None:
+        """Update bot's Discord activity status."""
+        if not self.player:
+            return
 
-            for queue in self._event_queues:
-                event = queue.safe_get()
-
-                if event:
-                    self._log.debug(
-                        f"Received event: {event.msg_src}, " f"{event.msg_type.name}"
-                    )
-                    await self._handle_event(event)
-
-            if self._state.sxm_running and not was_connected:
-                await self._sxm_running_message()
-                if self._pending is not None:
-                    await self.bot_output(
-                        "Automatically resuming previous channel: "
-                        f"`{self._pending[0].id}`"
-                    )
-                    await self._reset_live(self._pending[1], self._pending[0])
-            elif not self._state.sxm_running and was_connected:
-                await self.bot_output(
-                    "Connection to SXM was lost. Will automatically reconnect"
-                )
-                if self.player.is_playing and self.player.play_type == PlayType.LIVE:
-                    await self.player.stop(disconnect=False)
-
-            if time.monotonic() > (self._last_update + self._update_interval):
-                await self.update()
-                self._last_update = time.monotonic()
-
-            await asyncio.sleep(0.1)
-
-    async def event_loop(self):
-        while True:
-            try:
-                await self._event_loop()
-            except Exception:
-                self._log.exception("Error doing event loop!")
-                await asyncio.sleep(5)
-
-    async def create_carousel(self, ctx: SlashContext, carousel: ReactionCarousel):
-        await carousel.update(self._state, ctx)
-
-        if len(carousel.items) > 1 and carousel.message is not None:
-            self.carousels[carousel.message.id] = carousel
-
-    def _get_acvitity(self):
         activity: Optional[Activity] = None
+
         if self.player.play_type == PlayType.LIVE:
             if self._state.live is not None:
                 xm_channel = self._state.get_channel(self._state.stream_channel)
-                activity = SXMActivity(
-                    start=self._state.start_time,
-                    radio_time=self._state.radio_time,
-                    channel=xm_channel,
-                    live_channel=self._state.live,
-                )
-            else:
-                self._log.debug("Could not update status, live is none")
-        elif self.player.current is not None and isinstance(
-            self.player.current.audio_file, Song
-        ):
-            activity = SongActivity(song=self.player.current.audio_file)
-        else:
-            activity = Game(name=self.player.current.audio_file.pretty_name)
-
-        return activity
-
-    async def update(self):
-        activity: Optional[Activity] = None
-        if self.player.is_playing:
-            self._voice_timeout = 0
-            activity = self._get_acvitity()
-        elif self.player.voice is not None:
-            self._voice_timeout += 1
-
-            if self._voice_timeout > 5:
-                self._log.info("In voice, but nothing is playing, exiting...")
-                await self.player.stop(kill_hls=False)
-                if self._pending is not None and self._state.sxm_running:
-                    self._log.info("SXM stream disappeared. Restarting...")
-                    self.bot.loop.create_task(
-                        self._reset_live(self._pending[1], self._pending[0])
-                    )
-        elif self.player.voice is None and self.bot.user is not None:
-            self._voice_timeout = 0
-
-            if len(self.bot.guilds) > 0:
-                guild = self.bot.guilds[0]
-                member = guild.get_member(self.bot.user.id)
-                if member.voice is not None:
-                    self._log.info("Found old voice channel for bot, leaving...")
-                    await member.move_to(None)
-
-        self._log.debug(f"Updating bot's status: {activity}")
-        try:
-            await self.bot.change_presence(activity=activity)
-        except AttributeError:
-            pass
-
-        for key, carousel in list(self.carousels.items()):
-            seconds_ago = (datetime.now() - carousel.last_update).total_seconds()
-            if seconds_ago > CAROUSEL_TIMEOUT:
-                self._log.info(f"Deleting carousel for message ID {key}")
-                await carousel.refresh_message(self.bot)
-                await carousel.clear_reactions()
-                del self.carousels[key]
-
-    async def _handle_event(self, event: EventMessage):
-        if event.msg_type == EventTypes.SXM_STATUS:
-            self._state.sxm_running = event.msg
-        elif event.msg_type == EventTypes.HLS_STREAM_STARTED:
-            self._state.update_stream_data(event.msg)
-
-            if self.player.play_type == PlayType.LIVE or self.player.play_type is None:
-
-                if self.player.play_type == PlayType.LIVE:
-                    await self.player.stop(disconnect=False)
-
-                xm_channel = self._state.get_channel(event.msg[0])
-
                 if xm_channel is not None:
-                    await self.player.add_live_stream(xm_channel, event.msg[1])
-            else:
-                self._log.debug("Ignoring new HLS stream")
-        elif event.msg_type == EventTypes.UPDATE_METADATA:
-            self._state.set_raw_live(event.msg)
-        elif event.msg_type == EventTypes.UPDATE_CHANNELS:
-            self._state.update_channels(event.msg)
-        elif event.msg_type == EventTypes.KILL_HLS_STREAM:
-            await self.player.stop(kill_hls=False)
-            if event.msg_src == self.name:
-                self._pending = None
-            elif self._pending is not None and self._state.sxm_running:
-                self.bot.loop.create_task(
-                    self._reset_live(self._pending[1], self._pending[0])
-                )
-        else:
-            self._log.warning(
-                f"Unknown event received: {event.msg_src}, {event.msg_type}"
+                    activity = SXMActivity(
+                        self._state.start_time,
+                        self._state.radio_time,
+                        xm_channel,
+                        self._state.live,
+                    )
+        elif self.player.play_type in (PlayType.FILE, PlayType.RANDOM):
+            if self.player.current and self.player.current.audio_file:
+                activity = SongActivity(self.player.current.audio_file)  # type: ignore
+
+        if activity:
+            await self.bot.change_presence(activity=activity)
+
+    async def _reset_live(
+        self,
+        voice_channel: VoiceChannel,
+        xm_channel: XMChannel
+    ) -> None:
+        """Reset and restart live stream."""
+        if not self.player:
+            return
+
+        await self.player.stop(kill_hls=False)
+        await self.player.cleanup()
+
+        # Create new player
+        self.player = AudioPlayer(self.event_queue, self.bot.loop)
+        await self.player.start()
+
+        await asyncio.sleep(5)  # Allow time for cleanup
+
+        await self.player.set_voice(voice_channel)
+        await self.player.add_live_stream(xm_channel)
+
+    # Helper Methods
+    async def bot_output(self, message: str) -> None:
+        """Send a message to the output channel."""
+        self._log.info(f"Bot output: {message}")
+        if self.output_channel is not None:
+            try:
+                await self.output_channel.send(message)
+            except discord.HTTPException as e:
+                self._log.warning(f"Failed to send output: {e}")
+
+    async def _summon(self, interaction: discord.Interaction) -> bool:
+        """Summon bot to user's voice channel."""
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True
             )
+            return False
+
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member or not member.voice or not member.voice.channel:
+            await interaction.response.send_message(
+                "You must be in a voice channel.",
+                ephemeral=True
+            )
+            return False
+
+        if self.player:
+            await self.player.set_voice(member.voice.channel)
+            self._last_voice_activity = time.monotonic()
+
+        return True
 
     async def _play_file(
         self,
-        ctx: SlashContext,
+        interaction: discord.Interaction,
         item: Union[Song, Episode],
         message: bool = True,
     ) -> None:
-        """Queues a file to be played"""
+        """Queue a file to be played."""
+        if not self.player:
+            return
 
         if self.player.is_playing:
             if self.player.play_type != PlayType.FILE:
@@ -336,70 +443,96 @@ class DiscordWorker(
                 await self.player.stop(disconnect=False)
                 await asyncio.sleep(0.5)
         else:
-            await self._summon(ctx)
+            if not await self._summon(interaction):
+                return
 
         try:
-            self._log.info(f"play: {item.file_path}")
+            self._log.info(f"Playing: {item.file_path}")
             await self.player.add_file(item)
         except Exception:
-            self._log.error("error while trying to add file to play queue:")
-            self._log.error(traceback.format_exc())
+            self._log.error(f"Error adding file: {traceback.format_exc()}")
+            if interaction.response.is_done():
+                await interaction.followup.send("Failed to add to queue")
+            else:
+                await interaction.response.send_message("Failed to add to queue")
         else:
             if message:
-                await send_message(ctx, f"added {item.bold_name} to now playing queue")
+                msg = f"Added **{item.bold_name}** to now playing queue"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg)
+                else:
+                    await interaction.response.send_message(msg)
 
-    async def _reset_live(self, voice_channel: VoiceChannel, xm_channel: XMChannel):
-        await self.player.stop(kill_hls=False)
-        await self.player.cleanup()
-        self.player = AudioPlayer(self.event_queue, self.bot.loop)
-        await asyncio.sleep(10)
-        await self.player.set_voice(voice_channel)
-        await self.player.add_live_stream(xm_channel)
+    async def create_carousel(
+        self,
+        interaction: discord.Interaction,
+        carousel: ReactionCarousel
+    ) -> None:
+        """Create and register a reaction carousel."""
+        await carousel.update(self._state, interaction)
 
-    @cog_ext.cog_subcommand(base=get_root_command())
-    async def playing(self, ctx: SlashContext) -> None:
-        """Responds with what the bot currently playing"""
+        if len(carousel.items) > 1 and carousel.message is not None:
+            self.carousel_manager.add(carousel.message.id, carousel)
 
-        if not await is_playing(ctx):
+    # Slash Commands
+    @app_commands.command(name="playing", description="Show what's currently playing")
+    async def playing(self, interaction: discord.Interaction) -> None:
+        """Responds with what the bot is currently playing."""
+        if not self.player or not self.player.is_playing:
+            await interaction.response.send_message("Nothing is currently playing.")
             return
 
-        channel: VoiceChannel = self.player.voice.channel  # type: ignore
+        channel = self.player.voice.channel if self.player.voice else None
+        channel_mention = channel.mention if channel else "Unknown"
+
         if self.player.play_type == PlayType.LIVE:
-            if self._state.stream_channel is None or self.player.voice is None:
+            if self._state.stream_channel is None:
+                await interaction.response.send_message("Live stream information unavailable.")
                 return
 
             xm_channel, embed = generate_now_playing_embed(self._state)
-            message = (
-                f"Currently playing **{xm_channel.pretty_name}** on "
-                f"**{channel.mention}**"
+            await interaction.response.send_message(
+                f"Currently playing **{xm_channel.pretty_name}** on {channel_mention}",
+                embed=embed
             )
-            await send_message(ctx, message, embed=embed)
-        elif (
-            self.player.current is not None
-            and self.player.current.audio_file is not None
-            and self.player.voice is not None
-        ):
+        elif self.player.current and self.player.current.audio_file:
             name = self.player.current.audio_file.bold_name
-            await send_message(
-                ctx,
-                f"Currently playing {name} on **{channel.mention}**",
-                embed=generate_embed_from_archived(self.player.current.audio_file),
+            embed = generate_embed_from_archived(self.player.current.audio_file)
+            await interaction.response.send_message(
+                f"Currently playing {name} on {channel_mention}",
+                embed=embed
             )
+        else:
+            await interaction.response.send_message("Unable to determine what's playing.")
 
-    async def _recent_live(self, ctx, count):
-        if self._state.stream_channel is None or self.player.voice is None:
+    @app_commands.command(name="recent", description="Show recently played songs")
+    @app_commands.describe(count="Number of songs to show (1-10)")
+    async def recent(
+        self,
+        interaction: discord.Interaction,
+        count: app_commands.Range[int, 1, 10] = 3
+    ) -> None:
+        """Show recently played songs."""
+        if not self.player or not self.player.is_playing:
+            await interaction.response.send_message("Nothing is currently playing.")
             return
 
-        xm_channel, song_cuts, latest_cut = get_recent_songs(self._state, count)
+        if self.player.play_type == PlayType.LIVE:
+            if self._state.stream_channel is None:
+                await interaction.response.send_message("No channel information available.")
+                return
 
-        total = len(song_cuts)
-        if total > 0:
-            if total == 1:
-                message = f"Most recent song for **{xm_channel.pretty_name}**:"
-            else:
-                message = (
-                    f"{total} most recent songs for " f"**{xm_channel.pretty_name}**:"
-                )
+            xm_channel, song_cuts, latest_cut = get_recent_songs(self._state, count)
+
+            if not song_cuts:
+                await interaction.response.send_message("No recent songs played.")
+                return
+
+            message = (
+                f"Most recent song for **{xm_channel.pretty_name}**:"
+                if len(song_cuts) == 1
+                else f"{len(song_cuts)} most recent songs for **{xm_channel.pretty_name}**:"
+            )
 
             carousel = SXMCutCarousel(
                 items=song_cuts,
@@ -407,155 +540,122 @@ class DiscordWorker(
                 channel=xm_channel,
                 body=message,
             )
-            await self.create_carousel(ctx, carousel)
+            await self.create_carousel(interaction, carousel)
         else:
-            await send_message(ctx, "No recent songs played")
+            recent_list = list(self.player.recent)[:count]
+            if not recent_list:
+                await interaction.response.send_message("No recent songs.")
+                return
 
-    @cog_ext.cog_subcommand(
-        base=get_root_command(),
-        options=[
-            create_option(
-                name="count",
-                description="Number of songs to return (1-10)",
-                option_type=4,
-                required=False,
+            carousel = ArchivedSongCarousel(
+                items=recent_list,
+                body="Recent songs/shows"
             )
-        ],
-    )
-    async def recent(self, ctx: SlashContext, count: int = 3) -> None:
-        """Responds with the last 1-10 songs that been
-        played on this channel"""
+            await self.create_carousel(interaction, carousel)
 
-        try:
-            count = await CountConverter().convert(ctx, count)
-        except BadArgument as e:
-            await send_message(ctx, str(e))
+    @app_commands.command(name="stop", description="Stop playing and leave voice channel")
+    async def stop(self, interaction: discord.Interaction) -> None:
+        """Stop playing and disconnect."""
+        if not self.player:
+            await interaction.response.send_message("Bot is not active.")
             return
 
-        if not await is_playing(ctx):
-            return
+        self._pending = None
+        await self.player.stop()
+        await interaction.response.send_message("Stopped playing music.")
 
-        if self.player.play_type == PlayType.LIVE:
-            return await self._recent_live(ctx, count)
-
-        carousel = ArchivedSongCarousel(
-            items=list(self.player.recent[:count]), body="Recent songs/shows"
-        )
-        await self.create_carousel(ctx, carousel)
-
-    @cog_ext.cog_subcommand(
-        base=get_root_command(),
-        options=[
-            create_option(
-                name="do_repeat",
-                description="On/Off",
-                option_type=5,
-                required=False,
+    @app_commands.command(name="summon", description="Join your voice channel")
+    async def summon(self, interaction: discord.Interaction) -> None:
+        """Join the user's voice channel."""
+        if await self._summon(interaction):
+            member = interaction.guild.get_member(interaction.user.id)
+            await interaction.response.send_message(
+                f"Joined {member.voice.channel.mention}"
             )
-        ],
-    )
-    async def repeat(self, ctx: SlashContext, do_repeat: Optional[bool] = None) -> None:
-        """Set/Unset play queue to repeat infinitely"""
 
-        if not await is_playing(ctx):
+    @app_commands.command(name="reset", description="Force reset the audio player")
+    async def reset(self, interaction: discord.Interaction) -> None:
+        """Hard reset the audio player."""
+        if not await self._summon(interaction):
             return
 
-        if do_repeat is None:
+        if self.player:
+            self._pending = None
+            await self.player.stop()
+            await self.player.cleanup()
+
+        # Create new player
+        self.player = AudioPlayer(self.event_queue, self.bot.loop)
+        await self.player.start()
+
+        await interaction.response.send_message("Bot reset successfully.")
+
+    @app_commands.command(name="repeat", description="Toggle repeat mode")
+    @app_commands.describe(enabled="Turn repeat on or off")
+    async def repeat(
+        self,
+        interaction: discord.Interaction,
+        enabled: Optional[bool] = None
+    ) -> None:
+        """Set or check repeat mode."""
+        if not self.player or not self.player.is_playing:
+            await interaction.response.send_message("Nothing is currently playing.")
+            return
+
+        if enabled is None:
             status = "on" if self.player.repeat else "off"
-            await send_message(ctx, f"Repeat is currently {status}")
+            await interaction.response.send_message(f"Repeat is currently {status}.")
         elif self.player.play_type == PlayType.LIVE:
-            await send_message(
-                ctx, "Cannot change repeat while playing a SXM live channel"
+            await interaction.response.send_message(
+                "Cannot change repeat while playing live SXM."
             )
         elif self.player.play_type == PlayType.RANDOM:
-            await send_message(
-                ctx,
-                "Cannot change repeat while playing a SXM Archive playlist",
+            await interaction.response.send_message(
+                "Cannot change repeat while playing random playlist."
             )
         else:
-            self.player.repeat = do_repeat
-            status = "on" if self.player.repeat else "off"
-            await send_message(ctx, f"Set repeat to {status}")
-
-    @cog_ext.cog_subcommand(base=get_root_command())
-    async def reset(self, ctx: SlashContext) -> None:
-        """Forces bot to leave voice and hard resets audio player"""
-
-        if not await require_voice(ctx):
-            return
-
-        await self._summon(ctx)
-        self._pending = None
-        await self.player.stop()
-        await self.player.cleanup()
-
-        self.player = AudioPlayer(self.event_queue, self.bot.loop)
-
-        await send_message(ctx, "Bot reset successfully")
-
-    @cog_ext.cog_subcommand(base=get_root_command())
-    async def stop(self, ctx: SlashContext) -> None:
-        """Stops playing audio and leaves the voice channel.
-        This also clears the queue.
-        """
-
-        if not await no_pm(ctx) or not await is_playing(ctx):
-            return
-
-        self._pending = None
-        await self.player.stop()
-        await send_message(ctx, "Stopped playing music")
-
-    async def _summon(self, ctx: SlashContext) -> None:
-        if not await no_pm(ctx) or not await require_voice(ctx):
-            return
-
-        summoned_channel = ctx.author.voice.channel
-        await self.player.set_voice(summoned_channel)
-
-    @cog_ext.cog_subcommand(base=get_root_command())
-    async def summon(self, ctx: SlashContext) -> None:
-        """Summons the bot to join your voice channel"""
-
-        await self._summon(ctx)
-        await send_message(
-            ctx, f"Successfully joined {ctx.author.voice.channel.mention}"
-        )
+            self.player.repeat = enabled
+            status = "on" if enabled else "off"
+            await interaction.response.send_message(f"Set repeat to {status}.")
 
 
-class DiscordArchivedWorker(
-    SXMArchivedCommands,
-    DiscordWorker,
-    name=SXM_COG_NAME,
-):
-    @cog_ext.cog_subcommand(base=get_root_command())
-    async def skip(self, ctx: SlashContext) -> None:
-        """Skips current song. Does not work for SXM"""
+class DiscordArchivedWorker(DiscordWorker):
+    """Extended worker with archived content commands."""
 
-        if not await no_pm(ctx) or not await is_playing(ctx):
+    @app_commands.command(name="skip", description="Skip the current song")
+    async def skip(self, interaction: discord.Interaction) -> None:
+        """Skip the current song."""
+        if not self.player or not self.player.is_playing:
+            await interaction.response.send_message("Nothing is playing.")
             return
 
         if self.player.play_type == PlayType.LIVE:
-            await send_message(ctx, "Cannot skip. SXM radio is playing")
+            await interaction.response.send_message("Cannot skip live SXM radio.")
             return
 
         await self.player.skip()
-        await send_message(ctx, "Song skipped")
+        await interaction.response.send_message("Song skipped.")
 
-    @cog_ext.cog_subcommand(base=get_root_command())
-    async def upcoming(self, ctx: SlashContext) -> None:
-        """Displaying the songs/shows on play queue. Does not
-        work for live SXM radio"""
-
-        if not await is_playing(ctx):
+    @app_commands.command(name="upcoming", description="Show upcoming songs in queue")
+    async def upcoming(self, interaction: discord.Interaction) -> None:
+        """Show the upcoming song queue."""
+        if not self.player or not self.player.is_playing:
+            await interaction.response.send_message("Nothing is playing.")
             return
 
         if self.player.play_type == PlayType.LIVE:
-            await send_message(ctx, "Live radio playing, cannot get upcoming")
-        elif self.player.current is not None:
-            carousel = UpcomingSongCarousel(
-                items=list(self.player.upcoming),
-                body="Upcoming songs/shows:",
-                latest=self.player.current.audio_file,
-            )
-            await self.create_carousel(ctx, carousel)
+            await interaction.response.send_message("Live radio playing - no queue.")
+            return
+
+        upcoming_list = list(self.player.upcoming)
+        if not upcoming_list:
+            await interaction.response.send_message("Queue is empty.")
+            return
+
+        current = self.player.current.audio_file if self.player.current else None
+        carousel = UpcomingSongCarousel(
+            items=upcoming_list,
+            body="Upcoming songs/shows:",
+            latest=current,
+        )
+        await self.create_carousel(interaction, carousel)

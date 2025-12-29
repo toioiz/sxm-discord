@@ -1,384 +1,418 @@
+"""
+SXM-specific commands for the Discord bot.
+
+Provides commands for:
+- Playing live SXM channels
+- Searching archived content
+- Creating random playlists
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
-import traceback
-from typing import List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
-from discord import VoiceChannel
-from discord.ext.commands import BadArgument, Context
-from discord_slash import SlashContext, cog_ext  # type: ignore
-from discord_slash.utils.manage_commands import create_option  # type: ignore
+import discord
+from discord import app_commands
 from sqlalchemy import or_
 from sxm.models import XMChannel
-from sxm_player.models import DBEpisode, DBSong, Episode, PlayerState, Song
 from tabulate import tabulate
 
-from sxm_discord.checks import require_sxm, require_voice
-from sxm_discord.converters import XMChannelConverter, XMChannelListConverter
-from sxm_discord.models import ArchivedSongCarousel, ReactionCarousel
-from sxm_discord.music import AudioPlayer
-from sxm_discord.utils import get_root_command, send_message
+from .models import ArchivedSongCarousel, PlayType
+from .utils import get_root_command
+
+if TYPE_CHECKING:
+    from sxm_player.models import DBEpisode, DBSong, Episode, PlayerState, Song
+    from .music import AudioPlayer
 
 
-class SXMCommands:
-    _log: logging.Logger
+logger = logging.getLogger(__name__)
+
+
+class SXMCommandsMixin:
+    """
+    Mixin providing SXM-related slash commands.
+    
+    This mixin expects the following attributes on the class:
+    - player: AudioPlayer
+    - _state: PlayerState
+    - _pending: Optional[Tuple[XMChannel, VoiceChannel]]
+    - _log: logging.Logger
+    """
 
     player: AudioPlayer
     _state: PlayerState
-    _pending: Optional[Tuple[XMChannel, VoiceChannel]] = None
+    _pending: Optional[Tuple[XMChannel, discord.VoiceChannel]]
+    _log: logging.Logger
 
-    async def _play_archive_file(
-        self, ctx: Context, guid: str = None, is_song: bool = False
-    ) -> None:
-        """Queues a song/show file from SXM archive to be played"""
-
-        search_type = "shows"
-        if is_song:
-            search_type = "songs"
-
-        if not await require_voice(ctx):
-            return
-
-        if guid is None:
-            await send_message(ctx, f"Please provide a {search_type} id")
-            return
-
-        audio_file: Union[Song, Episode, None] = None
-        if self._state.db is not None:
-            if is_song:
-                db_song = self._state.db.query(DBSong).filter_by(guid=guid).first()
-                if db_song is not None:
-                    audio_file = Song.from_orm(db_song)
-            else:
-                db_episode = (
-                    self._state.db.query(DBEpisode).filter_by(guid=guid).first()
-                )
-                if db_episode is not None:
-                    audio_file = Episode.from_orm(db_episode)
-
-        if audio_file is not None and not os.path.exists(audio_file.file_path):
-            self._log.warn(f"File does not exist: {audio_file.file_path}")
-            audio_file = None
-
-        if audio_file is None:
-            await send_message(ctx, f"Invalid {search_type} id")
-            return
-
-        await self._play_file(ctx, audio_file)
-
-    async def _play_file(
-        self, ctx: Context, item: Union[Song, Episode], message: bool = True
-    ) -> None:
-        raise NotImplementedError()
-
-    async def _search_archive(self, ctx: Context, search: str, is_song: bool) -> None:
-        """Searches song/show database and responds with results"""
-
-        if self._state.db is None:
-            await send_message(ctx, "No active db connection")
-            return
-
-        search_type = "shows"
-        if is_song:
-            search_type = "songs"
-
-        items: List[Union[Song, Episode]] = []
-        if is_song:
-            db_songs = (
-                self._state.db.query(DBSong)
-                .filter(
-                    or_(
-                        DBSong.guid.ilike(f"{search}%"),
-                        DBSong.title.ilike(f"{search}%"),
-                        DBSong.artist.ilike(f"{search}%"),
-                    )
-                )
-                .order_by(DBSong.air_time.desc())[:10]
-            )
-            items = [Song.from_orm(i) for i in db_songs]
-        else:
-            db_episodes = (
-                self._state.db.query(DBEpisode)
-                .filter(
-                    or_(
-                        DBEpisode.guid.ilike(f"{search}%"),
-                        DBEpisode.title.ilike(f"{search}%"),
-                        DBEpisode.show.ilike(f"{search}%"),
-                    )
-                )
-                .order_by(DBEpisode.air_time.desc())[:10]
-            )
-            items = [Episode.from_orm(i) for i in db_episodes]
-
-        if len(items) > 0:
-            message = f"{search_type.title()} matching `{search}`:"
-            if is_song:
-                carousel = ArchivedSongCarousel(items=list(items), body=message)
-                await self.create_carousel(ctx, carousel)
-            else:
-                message += "\n\n"
-                for item in items:
-                    message += f"{item.guid}: {item.bold_name}\n"
-
-                await send_message(ctx, message)
-        else:
-            await send_message(ctx, f"No {search_type} results found for `{search}`")
-
-    async def _summon(self, ctx: SlashContext) -> None:
+    async def _summon(self, interaction: discord.Interaction) -> bool:
+        """Summon the bot to user's voice channel."""
         raise NotImplementedError()
 
     async def create_carousel(
-        self, ctx: SlashContext, carousel: ReactionCarousel
+        self,
+        interaction: discord.Interaction,
+        carousel
     ) -> None:
+        """Create a reaction carousel."""
         raise NotImplementedError()
 
-    @cog_ext.cog_subcommand(
-        base=get_root_command(),
-        subcommand_group="sxm",
-        name="channel",
-        options=[
-            create_option(
-                name="channel",
-                description="SXM Channel",
-                option_type=3,
-                required=False,
-            )
-        ],
+    async def _play_file(
+        self,
+        interaction: discord.Interaction,
+        item: Union[Song, Episode],
+        message: bool = True,
+    ) -> None:
+        """Queue a file for playback."""
+        raise NotImplementedError()
+
+    def _parse_channel(
+        self,
+        channel_input: str
+    ) -> Optional[XMChannel]:
+        """Parse a channel string to XMChannel."""
+        channel_input = channel_input.strip().lower()
+
+        for channel in self._state.channels:
+            # Match by ID
+            if channel.id.lower() == channel_input:
+                return channel
+            # Match by number
+            if channel.channel_number == channel_input:
+                return channel
+            # Match by name (partial)
+            if channel_input in channel.name.lower():
+                return channel
+
+        return None
+
+    def _parse_channels(
+        self,
+        channels_input: str
+    ) -> List[XMChannel]:
+        """Parse multiple channel specifications."""
+        result = []
+        parts = [p.strip() for p in channels_input.split(',')]
+
+        for part in parts:
+            channel = self._parse_channel(part)
+            if channel:
+                result.append(channel)
+
+        return result
+
+    @app_commands.command(
+        name="sxm-channel",
+        description="Play a SiriusXM channel"
     )
-    async def sxm_channel(self, ctx: SlashContext, *, channel: str) -> None:
-        """Plays a specific SXM channel"""
-
-        if not await require_voice(ctx) or not await require_sxm(ctx):
+    @app_commands.describe(channel="Channel ID, number, or name")
+    async def sxm_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: str
+    ) -> None:
+        """Play a specific SXM channel."""
+        # Check SXM status
+        if not self._state.sxm_running:
+            await interaction.response.send_message(
+                "SXM is not currently connected. Please wait...",
+                ephemeral=True
+            )
             return
 
-        try:
-            xm_channel = await XMChannelConverter().convert(ctx, channel)
-        except BadArgument as e:
-            await send_message(ctx, str(e))
+        # Check voice channel
+        if not await self._require_voice(interaction):
             return
 
+        # Parse channel
+        xm_channel = self._parse_channel(channel)
+        if xm_channel is None:
+            await interaction.response.send_message(
+                f"Could not find channel: `{channel}`\n"
+                f"Use `/sxm-channels` to see available channels.",
+                ephemeral=True
+            )
+            return
+
+        # Stop current playback if needed
         if self.player.is_playing:
             self._pending = None
             await self.player.stop(disconnect=False)
             await asyncio.sleep(0.5)
         else:
-            await self._summon(ctx)
+            if not await self._summon(interaction):
+                return
+
+        # Defer response for long operation
+        if not interaction.response.is_done():
+            await interaction.response.defer()
 
         try:
-            self._log.info(f"play: {xm_channel.id}")
+            self._log.info(f"Playing SXM channel: {xm_channel.id}")
             await self.player.add_live_stream(xm_channel)
-        except Exception:
-            self._log.error("error while trying to add channel to play queue:")
-            self._log.error(traceback.format_exc())
-            await self.player.stop()
-            await send_message(ctx, "Something went wrong starting stream")
-        else:
-            if self.player.voice is not None:
-                self._pending = (xm_channel, self.player.voice.channel)  # type: ignore
-                await send_message(
-                    ctx,
-                    (
-                        f"Started playing **{xm_channel.pretty_name}** in "
-                        f"**{ctx.author.voice.channel.mention}**"
-                    ),
+
+            if self.player.voice:
+                self._pending = (xm_channel, self.player.voice.channel)
+
+                member = interaction.guild.get_member(interaction.user.id)
+                voice_channel = member.voice.channel if member.voice else None
+                channel_mention = voice_channel.mention if voice_channel else "voice"
+
+                await interaction.followup.send(
+                    f"Started playing **{xm_channel.pretty_name}** in {channel_mention}"
                 )
+        except Exception as e:
+            self._log.error(f"Error starting stream: {e}")
+            await self.player.stop()
+            await interaction.followup.send("Something went wrong starting the stream.")
 
-    @cog_ext.cog_subcommand(
-        base=get_root_command(), subcommand_group="sxm", name="channels"
+    @app_commands.command(
+        name="sxm-channels",
+        description="List available SXM channels"
     )
-    async def sxm_channels(self, ctx: SlashContext) -> None:
-        """Bot will PM with list of possible SXM channel"""
-
-        if not await require_sxm(ctx):
+    async def sxm_channels(self, interaction: discord.Interaction) -> None:
+        """Send a list of available channels via DM."""
+        if not self._state.sxm_running:
+            await interaction.response.send_message(
+                "SXM is not currently connected.",
+                ephemeral=True
+            )
             return
 
-        display_channels: List[Tuple[str, int, str, str]] = []
+        # Build channel table
+        display_channels = []
         for channel in self._state.channels:
-            display_channels.append(
-                (
-                    channel.id,
-                    int(channel.channel_number),
-                    channel.name,
-                    channel.short_description,
-                )
-            )
+            display_channels.append((
+                channel.id,
+                int(channel.channel_number),
+                channel.name,
+                channel.short_description[:40] + "..." if len(channel.short_description) > 40 else channel.short_description
+            ))
 
-        display_channels = sorted(display_channels, key=lambda l: l[1])
+        display_channels.sort(key=lambda x: x[1])
         channel_table = tabulate(
-            display_channels, headers=["ID", "#", "Name", "Description"]
+            display_channels,
+            headers=["ID", "#", "Name", "Description"]
         )
 
-        self._log.debug(f"sending {len(display_channels)} for {ctx.author}")
-        await ctx.author.send("SXM Channels:")
-        await send_message(ctx, "PM'd list of channels")
-        while len(channel_table) > 0:
-            message = ""
-            if len(channel_table) < 1900:
-                message = channel_table
-                channel_table = ""
-            else:
-                index = channel_table[:1900].rfind("\n")
-                message = channel_table[:index]
-                start = index + 1
-                channel_table = channel_table[start:]
+        await interaction.response.send_message(
+            "Sending channel list via DM...",
+            ephemeral=True
+        )
 
-            await ctx.author.send(f"```{message}```")
+        # Send via DM
+        try:
+            await interaction.user.send("**SXM Channels:**")
+
+            # Split into chunks
+            while channel_table:
+                if len(channel_table) < 1900:
+                    await interaction.user.send(f"```\n{channel_table}\n```")
+                    break
+                else:
+                    # Find last newline within limit
+                    idx = channel_table[:1900].rfind("\n")
+                    await interaction.user.send(f"```\n{channel_table[:idx]}\n```")
+                    channel_table = channel_table[idx + 1:]
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Could not send DM. Please enable DMs from server members.",
+                ephemeral=True
+            )
+
+    async def _require_voice(self, interaction: discord.Interaction) -> bool:
+        """Check if user is in a voice channel."""
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.",
+                ephemeral=True
+            )
+            return False
+
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member or not member.voice or not member.voice.channel:
+            await interaction.response.send_message(
+                "You must be in a voice channel to use this command.",
+                ephemeral=True
+            )
+            return False
+
+        return True
 
 
-class SXMArchivedCommands(SXMCommands):
-    @cog_ext.cog_subcommand(
-        base=get_root_command(),
-        subcommand_group="sxm",
-        name="playlist",
-        options=[
-            create_option(
-                name="channels",
-                description="SXM Channels to pick from",
-                option_type=3,
-                required=True,
-            ),
-            create_option(
-                name="threshold",
-                description="Number of songs for channel to be considered",
-                option_type=4,
-                required=False,
-            ),
-        ],
+class SXMArchivedCommandsMixin(SXMCommandsMixin):
+    """
+    Extended mixin with archived content commands.
+    
+    Provides playlist and search functionality.
+    """
+
+    @app_commands.command(
+        name="sxm-playlist",
+        description="Play random songs from archived channels"
+    )
+    @app_commands.describe(
+        channels="Comma-separated channel IDs or numbers",
+        threshold="Minimum songs required (default: 40)"
     )
     async def sxm_playlist(
         self,
-        ctx: SlashContext,
+        interaction: discord.Interaction,
         channels: str,
-        threshold: int = 40,
+        threshold: int = 40
     ) -> None:
-        """Play a random playlist from archived songs for a SXM channel."""
-
-        if not await require_voice(ctx):
+        """Create a random playlist from archived songs."""
+        if not await self._require_voice(interaction):
             return
 
-        try:
-            xm_channels = await XMChannelListConverter().convert(ctx, channels)
-        except BadArgument as e:
-            await send_message(ctx, str(e))
+        xm_channels = self._parse_channels(channels)
+        if not xm_channels:
+            await interaction.response.send_message(
+                f"No valid channels found in: `{channels}`",
+                ephemeral=True
+            )
             return
 
         if self._state.db is None:
+            await interaction.response.send_message(
+                "No database connection available.",
+                ephemeral=True
+            )
             return
 
-        channel_ids = [x.id for x in xm_channels]
-        unique_songs_query = self._state.db.query(DBSong.title, DBSong.artist).filter(
-            DBSong.channel.in_(channel_ids)
+        # Check song count
+        from sxm_player.models import DBSong
+
+        channel_ids = [c.id for c in xm_channels]
+        unique_songs = (
+            self._state.db.query(DBSong.title, DBSong.artist)
+            .filter(DBSong.channel.in_(channel_ids))
+            .distinct()
+            .count()
         )
-        unique_songs = unique_songs_query.distinct().all()
 
-        if len(unique_songs) < threshold:
-            await send_message(ctx, "not enough archived songs in provided channels")
+        if unique_songs < threshold:
+            await interaction.response.send_message(
+                f"Not enough archived songs ({unique_songs} < {threshold}).",
+                ephemeral=True
+            )
             return
 
+        # Stop current playback
         if self.player.is_playing:
             await self.player.stop(disconnect=False)
             await asyncio.sleep(0.5)
         else:
-            await self._summon(ctx)
+            if not await self._summon(interaction):
+                return
+
+        await interaction.response.defer()
 
         try:
             await self.player.add_playlist(xm_channels, self._state.db)
-        except Exception:
-            self._log.error("error while trying to create playlist:")
-            self._log.error(traceback.format_exc())
+
+            channel_names = ", ".join(c.pretty_name for c in xm_channels[:3])
+            if len(xm_channels) > 3:
+                channel_names += f" (+{len(xm_channels) - 3} more)"
+
+            await interaction.followup.send(
+                f"Started random playlist from **{channel_names}**"
+            )
+        except Exception as e:
+            self._log.error(f"Error creating playlist: {e}")
             await self.player.stop()
-            await send_message(ctx, "something went wrong starting playlist")
-        else:
-            voice_channel = ctx.author.voice.channel
-            if len(xm_channels) == 1:
-                await send_message(
-                    ctx,
-                    (
-                        "Started playing a playlist of random songs from"
-                        f"**{xm_channels[0].pretty_name}** in "
-                        f"**{voice_channel.mention}**"
-                    ),
+            await interaction.followup.send("Failed to create playlist.")
+
+    @app_commands.command(
+        name="sxm-search",
+        description="Search archived songs"
+    )
+    @app_commands.describe(query="Search by title or artist")
+    async def sxm_search(
+        self,
+        interaction: discord.Interaction,
+        query: str
+    ) -> None:
+        """Search for archived songs."""
+        if self._state.db is None:
+            await interaction.response.send_message(
+                "No database connection available.",
+                ephemeral=True
+            )
+            return
+
+        from sxm_player.models import DBSong, Song
+
+        results = (
+            self._state.db.query(DBSong)
+            .filter(
+                or_(
+                    DBSong.guid.ilike(f"{query}%"),
+                    DBSong.title.ilike(f"%{query}%"),
+                    DBSong.artist.ilike(f"%{query}%"),
                 )
-            else:
-                channel_nums = ", ".join([f"#{x.channel_number}" for x in xm_channels])
-                await send_message(
-                    ctx,
-                    (
-                        "Started playing a playlist of random songs from"
-                        f"**{channel_nums}** in **{voice_channel.mention}**"
-                    ),
-                )
-
-    @cog_ext.cog_subcommand(
-        base=get_root_command(),
-        subcommand_group="sxm",
-        name="show",
-        options=[
-            create_option(
-                name="show_id",
-                description="Show GUID",
-                option_type=3,
-                required=True,
             )
-        ],
-    )
-    async def sxm_show(self, ctx: SlashContext, show_id: Optional[str] = None) -> None:
-        """Adds a show to a play queue"""
+            .order_by(DBSong.air_time.desc())
+            .limit(10)
+            .all()
+        )
 
-        await self._play_archive_file(ctx, show_id, False)
-
-    @cog_ext.cog_subcommand(
-        base=get_root_command(),
-        subcommand_group="sxm",
-        name="shows",
-        options=[
-            create_option(
-                name="search",
-                description="Search Query",
-                option_type=3,
-                required=True,
+        if not results:
+            await interaction.response.send_message(
+                f"No songs found matching: `{query}`"
             )
-        ],
+            return
+
+        songs = [Song.from_orm(s) for s in results]
+
+        carousel = ArchivedSongCarousel(
+            items=songs,
+            body=f"Songs matching `{query}`:"
+        )
+        await self.create_carousel(interaction, carousel)
+
+    @app_commands.command(
+        name="sxm-play",
+        description="Play a specific archived song by GUID"
     )
-    async def sxm_shows(self, ctx: SlashContext, search: str) -> None:
-        """Searches for an archived show to play.
-        Only returns the first 10 shows"""
+    @app_commands.describe(guid="Song GUID from search results")
+    async def sxm_play(
+        self,
+        interaction: discord.Interaction,
+        guid: str
+    ) -> None:
+        """Play a specific archived song."""
+        if not await self._require_voice(interaction):
+            return
 
-        await self._search_archive(ctx, search, False)
-
-    @cog_ext.cog_subcommand(
-        base=get_root_command(),
-        subcommand_group="sxm",
-        name="song",
-        options=[
-            create_option(
-                name="song_id",
-                description="Song GUID",
-                option_type=3,
-                required=True,
+        if self._state.db is None:
+            await interaction.response.send_message(
+                "No database connection available.",
+                ephemeral=True
             )
-        ],
-    )
-    async def sxm_song(self, ctx: SlashContext, song_id: str) -> None:
-        """Adds a song to a play queue"""
+            return
 
-        await self._play_archive_file(ctx, song_id, True)
+        from sxm_player.models import DBSong, Song
 
-    @cog_ext.cog_subcommand(
-        base=get_root_command(),
-        subcommand_group="sxm",
-        name="songs",
-        options=[
-            create_option(
-                name="search",
-                description="Search Query",
-                option_type=3,
-                required=True,
+        db_song = self._state.db.query(DBSong).filter_by(guid=guid).first()
+
+        if db_song is None:
+            await interaction.response.send_message(
+                f"Song not found: `{guid}`",
+                ephemeral=True
             )
-        ],
-    )
-    async def sxm_songs(self, ctx: SlashContext, search: str) -> None:
-        """Searches for an archived song to play.
-        Only returns the first 10 songs"""
+            return
 
-        await self._search_archive(ctx, search, True)
+        song = Song.from_orm(db_song)
+
+        if not os.path.exists(song.file_path):
+            self._log.warning(f"File not found: {song.file_path}")
+            await interaction.response.send_message(
+                "Song file not found on disk.",
+                ephemeral=True
+            )
+            return
+
+        await self._play_file(interaction, song)

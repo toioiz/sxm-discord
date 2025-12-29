@@ -1,11 +1,12 @@
-# -*- coding: utf-8 -*-
+"""
+SXM Discord Bot - Improved Version
 
-"""Top-level package for sxm-discord."""
+A Discord bot that plays SiriusXM radio stations with proper memory management
+and modern discord.py 2.x support.
+"""
+
+__version__ = "0.3.0"
 
 from .player import DiscordPlayer
 
-__author__ = """Christopher Bailey"""
-__email__ = "cbailey@mort.is"
-__version__ = "0.2.5"
-
-__all__ = ["DiscordPlayer"]
+__all__ = ["DiscordPlayer", "__version__"]
